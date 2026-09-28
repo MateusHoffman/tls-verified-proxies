@@ -1,6 +1,6 @@
 use flate2::read::GzDecoder;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use std::{collections::HashSet, io::{Read, Write}, net::SocketAddrV4, sync::{Arc, LazyLock}, time::{Duration, Instant}};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
+use std::{collections::HashSet, io::{Read, Write}, net::SocketAddrV4, sync::{Arc, LazyLock, OnceLock}, time::{Duration, Instant}};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::mpsc::{UnboundedSender, unbounded_channel}, time::sleep_until};
 
 // Site de onde vem a lista de proxies
@@ -12,9 +12,32 @@ static CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
     let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
     Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
 });
+// O site do argumento, vivo até o fim do programa
+static TARGET: OnceLock<Target> = OnceLock::new();
+
+// Site que os proxies precisam alcançar
+struct Target {
+    // Como mostrar no resumo
+    label: String,
+    // Nome que o TLS confere no certificado
+    name: ServerName<'static>,
+    // Pedido CONNECT pronto, igual para todos os proxies
+    connect: Vec<u8>,
+}
 
 #[tokio::main]
 async fn main() {
+    // Sem link não há o que testar
+    let Some(arg) = std::env::args().nth(1) else {
+        eprintln!("uso: proxy <url>\nexemplo: proxy https://dashskins.com.br");
+        std::process::exit(2);
+    };
+    let Some(target) = parse(&arg) else {
+        eprintln!("url inválida: {arg}");
+        std::process::exit(2);
+    };
+    let target = TARGET.get_or_init(|| target);
+
     let start = Instant::now();
     // Baixa a lista nova ao mesmo tempo, sem esperar
     let (html_tx, mut html_rx) = unbounded_channel();
@@ -25,11 +48,11 @@ async fn main() {
     let mut tested = HashSet::new();
     // Lista guardada com menos de 15 min: começa por ela
     if std::fs::metadata(CACHE).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(15 * 60)) {
-        test(&std::fs::read_to_string(CACHE).unwrap_or_default(), &mut tested, &tx);
+        test(&std::fs::read_to_string(CACHE).unwrap_or_default(), &mut tested, &tx, target);
     }
     // Sem lista guardada: espera a nova chegar
     if tested.is_empty() {
-        test(&html_rx.recv().await.unwrap_or_default(), &mut tested, &tx);
+        test(&html_rx.recv().await.unwrap_or_default(), &mut tested, &tx, target);
     }
 
     // Os testes têm 1 segundo
@@ -46,14 +69,33 @@ async fn main() {
                 working.push(proxy);
             },
             // A lista nova chegou: testa os que faltavam
-            Some(html) = html_rx.recv() => test(&html, &mut tested, &tx),
+            Some(html) = html_rx.recv() => test(&html, &mut tested, &tx, target),
         }
     }
 
     // Salva o resultado e mostra o resumo
     let json: Vec<String> = working.iter().map(ToString::to_string).collect();
     std::fs::write("working.json", format!("{json:?}\n")).unwrap();
-    println!("{} funcionando de {} em {} ms → working.json", working.len(), tested.len(), start.elapsed().as_millis());
+    println!("{} funcionando de {} até {} em {} ms → working.json", working.len(), tested.len(), target.label, start.elapsed().as_millis());
+}
+
+// Tira o host e a porta do link: "https://site.com/algo" vira "site.com" e 443
+fn parse(arg: &str) -> Option<Target> {
+    // Fora o esquema e tudo que vem depois do host
+    let rest = arg.split_once("://").map_or(arg, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Porta depois dos dois-pontos; sem ela, 443
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 443),
+    };
+    // Um nome que o TLS saiba conferir, senão nem adianta testar
+    let name = ServerName::try_from(host.to_string()).ok()?;
+    Some(Target {
+        label: format!("{host}:{port}"),
+        name,
+        connect: format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").into_bytes(),
+    })
 }
 
 // Baixa a página com a lista de proxies
@@ -74,28 +116,26 @@ fn fetch() -> std::io::Result<String> {
 }
 
 // Acha os proxies no texto e testa os novos
-fn test(text: &str, tested: &mut HashSet<SocketAddrV4>, tx: &UnboundedSender<SocketAddrV4>) {
+fn test(text: &str, tested: &mut HashSet<SocketAddrV4>, tx: &UnboundedSender<SocketAddrV4>, target: &'static Target) {
     // Tudo que parece "1.2.3.4:8080"
     let proxies = text.split(|c: char| !c.is_ascii_digit() && c != '.' && c != ':').filter_map(|s| s.parse().ok());
     for proxy in proxies.filter(|&p| tested.insert(p)) {
-        // 2 sites x 2 jeitos: basta um dar certo
-        for target in ["example.com", "one.one.one.one"] {
-            for pipelined in [false, true] {
-                tokio::spawn(check(proxy, target, pipelined, tx.clone()));
-            }
+        // 2 jeitos de pedir: basta um dar certo
+        for pipelined in [false, true] {
+            tokio::spawn(check(proxy, target, pipelined, tx.clone()));
         }
     }
 }
 
 // O proxy leva até o site verdadeiro?
-async fn check(proxy: SocketAddrV4, target: &'static str, pipelined: bool, tx: UnboundedSender<SocketAddrV4>) -> Option<()> {
+async fn check(proxy: SocketAddrV4, target: &'static Target, pipelined: bool, tx: UnboundedSender<SocketAddrV4>) -> Option<()> {
     let mut stream = TcpStream::connect(proxy).await.ok()?;
     // Prepara o "olá" para o site
-    let mut tls = ClientConnection::new(CONFIG.clone(), target.try_into().ok()?).ok()?;
+    let mut tls = ClientConnection::new(CONFIG.clone(), target.name.clone()).ok()?;
     let mut hello = Vec::new();
     tls.write_tls(&mut hello).ok()?;
     // Pede ao proxy: "me liga a este site"
-    let mut request = format!("CONNECT {target}:443 HTTP/1.1\r\nHost: {target}:443\r\n\r\n").into_bytes();
+    let mut request = target.connect.clone();
     // Jeito rápido: manda o "olá" junto
     if pipelined {
         request.extend(&hello);

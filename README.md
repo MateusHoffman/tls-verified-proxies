@@ -6,8 +6,8 @@ Precisa do Rust. Compile uma vez:
 cargo build --release
 ```
 
-Rode:
+Rode passando o site que os proxies precisam alcançar (obrigatório):
 
 ```bash
-./target/release/proxy
+./target/release/proxy https://example.com.br
 ```
