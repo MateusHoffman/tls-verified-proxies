@@ -1,0 +1,16 @@
+[package]
+name = "proxy"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+flate2 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+webpki-roots = "1"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
