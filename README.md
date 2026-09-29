@@ -1,6 +1,6 @@
 # tls-verified-proxies
 
-Validador de proxies escrito em Rust. Baixa uma lista pública, testa centenas de proxies ao mesmo tempo e, em 1 segundo, devolve só os que realmente chegam até o site que você pediu.
+Validador de proxies escrito em Rust. Baixa uma lista pública, testa centenas de proxies ao mesmo tempo e devolve **um** proxy: o mais rápido que realmente chega até o site que você pediu.
 
 ## Por que isso existe
 
@@ -14,7 +14,7 @@ Empresas fazem isso o tempo todo. Um comparador de preços consulta 50 lojas por
 
 Existem listas públicas com milhares de proxies, de graça, na internet, mas são proxies ruins e muitas nem funciona.
 
-Com isso criei esse validador de proxies extremamente rápido, que processa centenas de proxies em apenas 1 segundo.
+Com isso criei esse validador de proxies extremamente rápido: ele dispara centenas de testes juntos e te entrega o primeiro que responder — que é, por definição, o mais rápido.
 
 ## Como funciona
 
@@ -26,7 +26,9 @@ No TLS 1.3 o servidor assina o handshake com a chave privada dele. Proxy nenhum 
 
 Fechou handshake, proxy aprovado. Nem precisa de resposta HTTP.
 
-rustls no TLS, com a raiz de confiança compilada no binário. tokio na concorrência: 1.200 testes disparados juntos, deadline global de 1 segundo.
+O primeiro a fechar o handshake é o mais rápido de todos. Então é ele que sai, e o programa encerra na hora — sem esperar o resto.
+
+rustls no TLS, com a raiz de confiança compilada no binário. tokio na concorrência: centenas de testes disparados juntos, limite de 1 segundo para alguém chegar.
 
 Cada proxy é testado de dois jeitos em paralelo, e basta um dar certo:
 
@@ -57,24 +59,30 @@ Sem porta na URL, vale 443. Para testar outra porta, escreva ela: `https://examp
 
 ## O que sai
 
-No terminal, um proxy por linha, na ordem em que fecharam o handshake — ou seja, do mais rápido ao mais lento — e no fim o resumo:
+Uma linha só na saída padrão: o proxy mais rápido. O resumo vai para a saída de erro, então não suja o resultado.
 
 ```
-20.197.203.93:8080
-107.150.41.226:18080
-45.76.68.10:9000
-14 funcionando de 1173 até example.com.br:443 em 1043 ms → working.json
+$ ./target/release/proxy https://dashskins.com.br
+213.111.146.36:18080
+mais rápido de 300 testados até dashskins.com.br:443 em 471 ms
 ```
 
-E o arquivo `working.json`, na pasta de onde você rodou, com a mesma lista pronta para outro programa consumir:
+Como a saída padrão tem só o endereço, dá para usar direto:
 
-```json
-["20.197.203.93:8080", "107.150.41.226:18080", "45.76.68.10:9000"]
+```bash
+PROXY=$(./target/release/proxy https://dashskins.com.br) && curl -x "http://$PROXY" https://dashskins.com.br
+```
+
+O código de saída diz se deu certo: `0` achou, `1` ninguém chegou no prazo, `2` a URL está errada.
+
+```
+$ ./target/release/proxy https://example.com.br
+nenhum dos 300 proxies alcançou example.com.br:443 em 1002 ms
 ```
 
 ## Detalhes
 
 - **Fonte da lista:** `free-proxy-list.net`, baixada a cada execução.
 - **Cache:** a página fica em `/tmp/free-proxy-list.txt` por 15 minutos. Tendo cache, os testes começam na hora enquanto a lista nova baixa em segundo plano — quando ela chega, os proxies inéditos entram no teste sem esperar a próxima rodada.
-- **Prazo:** 1 segundo, fixo. Quem não fechou o handshake até lá fica de fora.
+- **Prazo:** no máximo 1 segundo. Normalmente termina bem antes, porque encerra no primeiro que fecha o handshake — nos testes, entre 300 e 500 ms.
 - **O alvo importa:** um proxy pode alcançar um site e ser bloqueado em outro. Valide sempre contra o site que você vai usar de verdade.

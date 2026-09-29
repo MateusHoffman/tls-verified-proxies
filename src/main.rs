@@ -55,28 +55,25 @@ async fn main() {
         test(&html_rx.recv().await.unwrap_or_default(), &mut tested, &tx, target);
     }
 
-    // Os testes têm 1 segundo
+    // Os testes têm no máximo 1 segundo
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    // Do mais rápido ao mais lento
-    let mut working = Vec::new();
     loop {
         tokio::select! {
-            // Acabou o tempo
+            // Acabou o tempo e ninguém chegou
             _ = sleep_until(deadline) => break,
-            // Um proxy funcionou: mostra uma vez só
-            Some(proxy) = rx.recv() => if !working.contains(&proxy) {
+            // O primeiro a fechar o handshake é o mais rápido: é ele e acabou
+            Some(proxy) = rx.recv() => {
                 println!("{proxy}");
-                working.push(proxy);
+                eprintln!("mais rápido de {} testados até {} em {} ms", tested.len(), target.label, start.elapsed().as_millis());
+                std::process::exit(0);
             },
             // A lista nova chegou: testa os que faltavam
             Some(html) = html_rx.recv() => test(&html, &mut tested, &tx, target),
         }
     }
 
-    // Salva o resultado e mostra o resumo
-    let json: Vec<String> = working.iter().map(ToString::to_string).collect();
-    std::fs::write("working.json", format!("{json:?}\n")).unwrap();
-    println!("{} funcionando de {} até {} em {} ms → working.json", working.len(), tested.len(), target.label, start.elapsed().as_millis());
+    eprintln!("nenhum dos {} proxies alcançou {} em {} ms", tested.len(), target.label, start.elapsed().as_millis());
+    std::process::exit(1);
 }
 
 // Tira o host e a porta do link: "https://site.com/algo" vira "site.com" e 443
